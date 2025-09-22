@@ -1,0 +1,245 @@
+/**
+ * Google Ads Script: Simple Hourly Spend Logger  
+ * Purpose: Record hourly spend (and key metrics) per campaign type for the last 7 days.  
+ * Author: ClickPatrol - (Bernt Muurling) – 2025  
+ *
+ * How it works  
+ * ─────────────  
+ * • Every run pulls the spend for each campaign type (Shopping, Search, Display, …)  
+ *   for every day in the last CONFIG.daysToTrack days (default 7).  
+ * • The script writes one row per (retrieval-time × date × campaign-type) into the   
+ *   sheet defined in CONFIG.sheetName.  
+ * • By running the script hourly you build a time-series and can compare yesterday's
+ *   number retrieved "gisteren" versus "vandaag" → eventuele correcties door Google.  
+ *
+ * Sheet structure  
+ * ────────────────  
+ * | Retrieved At (timestamp) | Date | Campaign Type | Cost (€) | Clicks | Impressions | Conversions | Conversion Value (€) |
+ *
+ * Protect your Google Ads with ClickPatrol
+ * 7 days free trial: https://dashboard.clickpatrol.com/register
+ *
+ * Any further comparison/visualisation can be done via spreadsheet formulas or charts.
+ */
+
+// CONFIGURATION ──────────────────────────────────────────────────────────────
+const SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1SlqC70-b9keP6eMjir4qBIqobVmtaN6ui4r3v2BZsgY/";
+const CONFIG = {
+  daysToTrack: 7,            // How many days back to fetch
+  excludeToday: true,        // Skip today to avoid intra-day fluctuations
+  labelName: "none",        // Optional: Only campaigns containing this label
+  sheetName: "Learnit HourlyCosts", // Destination sheet name
+  timeZone: "Europe/Amsterdam",
+  DEBUG: true
+};
+
+/** Utility: log when DEBUG = true */
+function logDebug(msg) {
+  if (CONFIG.DEBUG) Logger.log(msg);
+}
+
+/** Entry point */
+function main() {
+  logDebug("=== Simple Hourly Spend Logger start ===");
+  const ss = SpreadsheetApp.openByUrl(SPREADSHEET_URL);
+  if (!ss) {
+    Logger.log("Spreadsheet access failed. Check SPREADSHEET_URL");
+    return;
+  }
+
+  // Allow config overrides via optional sheet called "Config"
+  updateConfigFromSheet(ss);
+
+  const sheet = getOrCreateSheet(ss, CONFIG.sheetName, getHeaders());
+  const records = fetchSpendPerType();
+
+  if (records.length === 0) {
+    logDebug("No records returned – nothing to write.");
+    return;
+  }
+
+  appendRecords(sheet, records);
+  logDebug(`Wrote ${records.length} records to sheet ${CONFIG.sheetName}`);
+  logDebug("=== Simple Hourly Spend Logger done ===");
+}
+
+/**
+ * Fetch spend and key metrics grouped by date & campaign type.
+ * Returns array of objects matching the sheet columns.
+ */
+function fetchSpendPerType() {
+  const now = new Date();
+  const endDate = new Date(now);
+  if (CONFIG.excludeToday) endDate.setDate(endDate.getDate() - 1);
+  const startDate = new Date(endDate);
+  startDate.setDate(startDate.getDate() - CONFIG.daysToTrack + 1);
+
+  const dateFrom = Utilities.formatDate(startDate, CONFIG.timeZone, 'yyyyMMdd');
+  const dateTo   = Utilities.formatDate(endDate,   CONFIG.timeZone, 'yyyyMMdd');
+  logDebug(`Fetching data from ${dateFrom} to ${dateTo}`);
+
+  // Optional label filtering → create a Set of campaignIds that have the label
+  let allowedCampaignIds = null;
+  if (CONFIG.labelName !== "none") {
+    allowedCampaignIds = getLabeledCampaignIds();
+    logDebug(`Label filter active → ${allowedCampaignIds.size} campaignIds allowed`);
+  }
+
+  const query = `SELECT \
+      segments.date,\n      campaign.id,\n      campaign.advertising_channel_type,\n      metrics.cost_micros,\n      metrics.clicks,\n      metrics.impressions,\n      metrics.conversions,\n      metrics.conversions_value\n    FROM campaign\n    WHERE segments.date BETWEEN '${dateFrom}' AND '${dateTo}'\n      AND campaign.status = 'ENABLED'`;
+
+  const report = AdsApp.report(query);
+  const rows   = report.rows();
+
+  // Aggregate per (date × campaignType)
+  const map = {};
+  while (rows.hasNext()) {
+    const r      = rows.next();
+    const cid    = r['campaign.id'];
+    if (allowedCampaignIds && !allowedCampaignIds.has(cid)) continue;
+
+    const date        = r['segments.date'];
+    const typeRaw     = r['campaign.advertising_channel_type'] || 'UNKNOWN';
+    const campaignType = classifyCampaignType(typeRaw);
+
+    const key = date + '|' + campaignType;
+    if (!map[key]) {
+      map[key] = {
+        date: date,
+        campaignType: campaignType,
+        cost: 0,
+        clicks: 0,
+        impressions: 0,
+        conversions: 0,
+        convValue: 0
+      };
+    }
+    const m = map[key];
+    m.cost         += (+r['metrics.cost_micros']) / 1e6; // to euros
+    m.clicks       += parseInt(r['metrics.clicks'])       || 0;
+    m.impressions  += parseInt(r['metrics.impressions'])  || 0;
+    m.conversions  += parseFloat(r['metrics.conversions'])|| 0;
+    m.convValue    += parseFloat(r['metrics.conversions_value']) || 0;
+  }
+
+  // Convert map → array of rows
+  const retrievedAt = new Date();
+  return Object.values(map).map(rec => ({
+    retrievedAt: retrievedAt,
+    date: rec.date,
+    campaignType: rec.campaignType,
+    cost: rec.cost,
+    clicks: rec.clicks,
+    impressions: rec.impressions,
+    conversions: rec.conversions,
+    convValue: rec.convValue
+  }));
+}
+
+/** Write records to sheet (appended beneath existing data) */
+function appendRecords(sheet, records) {
+  const rows = records.map(r => [
+    r.retrievedAt,
+    r.date,
+    r.campaignType,
+    r.cost,
+    r.clicks,
+    r.impressions,
+    r.conversions,
+    r.convValue
+  ]);
+
+  const startRow = sheet.getLastRow() + 1;
+  const range = sheet.getRange(startRow, 1, rows.length, rows[0].length);
+  range.setValues(rows);
+
+  // Basic formatting – currency columns
+  const eurCols = [4, 8]; // 1-indexed columns: Cost & Conversion value
+  eurCols.forEach(col => sheet.getRange(startRow, col, rows.length, 1).setNumberFormat('€#,##0.00'));
+}
+
+/** Ensure sheet exists and has headers */
+function getOrCreateSheet(ss, name, headers) {
+  let sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function getHeaders() {
+  return [
+    'Retrieved At',
+    'Date',
+    'Campaign Type',
+    'Cost (€)',
+    'Clicks',
+    'Impressions',
+    'Conversions',
+    'Conversion Value (€)'
+  ];
+}
+
+/**
+ * Returns a Set of campaign IDs that contain CONFIG.labelName
+ */
+function getLabeledCampaignIds() {
+  const customerId = AdsApp.currentAccount().getCustomerId().replace(/-/g, '');
+  const labelsIt   = AdsApp.labels().get();
+  const ids = [];
+  while (labelsIt.hasNext()) {
+    const l = labelsIt.next();
+    if (l.getName().includes(CONFIG.labelName)) ids.push(l.getId());
+  }
+  const campaignsSet = new Set();
+  ids.forEach(id => {
+    const labelStr = `customers/${customerId}/labels/${id}`;
+    const cIt = AdsApp.campaigns()
+      .withCondition(`campaign.labels CONTAINS ANY ('${labelStr}')`)
+      .withCondition('campaign.status = ENABLED')
+      .get();
+    while (cIt.hasNext()) campaignsSet.add(cIt.next().getId());
+  });
+  return campaignsSet;
+}
+
+/** Classify channel type → friendly name */
+function classifyCampaignType(channelType) {
+  switch ((channelType || '').toUpperCase()) {
+    case 'SEARCH':      return 'Search';
+    case 'DISPLAY':     return 'Display';
+    case 'SHOPPING':    return 'Shopping';
+    case 'VIDEO':       return 'YouTube';
+    case 'MULTI_CHANNEL': return 'Performance Max';
+    case 'HOTEL':       return 'Hotel';
+    case 'LOCAL':       return 'Local';
+    case 'DISCOVERY':   return 'Discovery';
+    case 'DEMAND_GEN':  return 'Demand Gen';
+    default:            return channelType.charAt(0).toUpperCase() + channelType.slice(1).toLowerCase();
+  }
+}
+
+/**
+ * Optionally override CONFIG values via a sheet called "Config" (2 columns)
+ */
+function updateConfigFromSheet(ss) {
+  const configSheet = ss.getSheetByName('Config');
+  if (!configSheet) return; // nothing to override
+  const rows = configSheet.getDataRange().getValues();
+  rows.forEach(r => {
+    if (!r[0] || r[1] === '') return;
+    const key = r[0].toString().trim();
+    const val = r[1];
+    switch (key) {
+      case 'daysToTrack':   CONFIG.daysToTrack   = parseInt(val) || CONFIG.daysToTrack; break;
+      case 'excludeToday':  CONFIG.excludeToday  = val === true || val.toString().toLowerCase()==='true'; break;
+      case 'labelName':     CONFIG.labelName     = val.toString(); break;
+      case 'sheetName':     CONFIG.sheetName     = val.toString(); break;
+      case 'DEBUG':         CONFIG.DEBUG         = val === true || val.toString().toLowerCase()==='true'; break;
+      case 'timeZone':      CONFIG.timeZone      = val.toString(); break;
+    }
+  });
+  logDebug('CONFIG overridden via Config sheet');
+} 
