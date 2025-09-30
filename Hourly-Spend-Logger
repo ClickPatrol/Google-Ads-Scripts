@@ -1,37 +1,56 @@
 /**
- * Google Ads Script: Simple Hourly Spend Logger  
- * Purpose: Record hourly spend (and key metrics) per campaign type for the last 7 days.  
- * Author: ClickPatrol - (Bernt Muurling) – 2025  
+ * Google Ads Script: Hourly & Daily Spend Logger  
+ * Purpose: Log historical campaign spend to detect retroactive adjustments by Google
+ * Author: ClickPatrol - Bernt Muurling – 2025
  *
- * How it works  
+ * Why use this script?
+ * ───────────────────
+ * Google Ads can retroactively adjust spend data without notification. These adjustments may not 
+ * always appear on your invoice or be visible in the dashboard. When ClickPatrol detects and blocks
+ * fraudulent clicks, Google may adjust your spend data retroactively. This script creates a historical 
+ * record by logging your spend data daily. After X days, YOU manually compare the logged data 
+ * in your spreadsheet with the current dashboard values for the same period to identify any 
+ * discrepancies and validate that spend adjustments occurred.
+ *
+ * Important notes:
+ * • We've observed that even HOURLY spend can be adjusted retroactively by Google
+ * • This logged data is for INDICATION purposes only - it shows what Google reported at the time
+ * • The script does NOT perform automatic comparisons - YOU must analyze the data yourself
+ * • We recommend analyzing DAILY costs first, then dive into hourly data if needed for deeper investigation
+ * • This tool is provided as-is for support purposes only
+ * • We do NOT provide further support on this script, as implementation varies per account
+ * • As a specialist, you know best how to validate and interpret this data for your account
+ *
+ * Setup instructions:
+ * ──────────────────
+ * 1. Make your OWN COPY of the spreadsheet (File → Make a copy)
+ * 2. Update SPREADSHEET_URL below with your copied spreadsheet URL
+ * 3. Configure the optional settings below if needed (don't change it when you don't need to)
+ * 4. Schedule this script to run HOURLY in Google Ads
+ *
+ * How it works:
  * ─────────────  
- * • Every run pulls the spend for each campaign type (Shopping, Search, Display, …)  
- *   for every day in the last CONFIG.daysToTrack days (default 7).  
- * • The script writes one row per (retrieval-time × date × campaign-type) into the   
- *   sheet defined in CONFIG.sheetName.  
- * • By running the script hourly you build a time-series and can compare yesterday's
- *   number retrieved "gisteren" versus "vandaag" → eventuele correcties door Google.  
+ * • Tab 1 (HourlyCosts): Logs the last complete hour per individual campaign
+ * • Tab 2 (DailyCosts): Logs yesterday's totals per campaign (with duplicate prevention)
+ * • Script runs every hour to build a time-series dataset
+ * • YOU compare this logged data with your dashboard after several days/weeks
  *
- * Sheet structure  
- * ────────────────  
- * | Retrieved At (timestamp) | Date | Campaign Type | Cost (€) | Clicks | Impressions | Conversions | Conversion Value (€) |
- *
- * Protect your Google Ads with ClickPatrol
- * 7 days free trial: https://dashboard.clickpatrol.com/register
- *
- * Any further comparison/visualisation can be done via spreadsheet formulas or charts.
+ * Tab 1 structure: Date | Hour | Campaign ID | Campaign Name | Campaign Type | Cost | Clicks | Impressions | Conversions | Conv. Value
+ * Tab 2 structure: Date | Campaign ID | Campaign Name | Campaign Type | Cost | Clicks | Impressions | Conversions | Conv. Value
  */
 
 // CONFIGURATION ──────────────────────────────────────────────────────────────
-const SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1SlqC70-b9keP6eMjir4qBIqobVmtaN6ui4r3v2BZsgY/";
+// IMPORTANT: Make a copy of the spreadsheet and insert YOUR spreadsheet URL below
+const SPREADSHEET_URL = "https://docs.google.com/spreadsheets/d/1j_IOYx1xvZ6cc1aCCKAhsv0nhxnviN9ymDhf1abwh1s/copy";
 const CONFIG = {
-  daysToTrack: 7,            // How many days back to fetch
-  excludeToday: true,        // Skip today to avoid intra-day fluctuations
-  labelName: "none",        // Optional: Only campaigns containing this label
-  sheetName: "Learnit HourlyCosts", // Destination sheet name
+  labelName: "none",        // Optional: Filter by label name (use "none" for all campaigns)
   timeZone: "Europe/Amsterdam",
-  DEBUG: true
+  DEBUG: true               // Set to false to reduce log output
 };
+
+// ════════════════════════════════════════════════════════════════════════════
+// DO NOT MODIFY ANYTHING BELOW THIS LINE
+// ════════════════════════════════════════════════════════════════════════════
 
 /** Utility: log when DEBUG = true */
 function logDebug(msg) {
@@ -40,122 +59,317 @@ function logDebug(msg) {
 
 /** Entry point */
 function main() {
-  logDebug("=== Simple Hourly Spend Logger start ===");
-  const ss = SpreadsheetApp.openByUrl(SPREADSHEET_URL);
-  if (!ss) {
-    Logger.log("Spreadsheet access failed. Check SPREADSHEET_URL");
-    return;
+  try {
+    logDebug("=== Hourly & Daily Spend Logger start ===");
+    
+    // Get account currency
+    const currencyCode = AdsApp.currentAccount().getCurrencyCode();
+    logDebug(`Account currency: ${currencyCode}`);
+    
+    const ss = SpreadsheetApp.openByUrl(SPREADSHEET_URL);
+    if (!ss) {
+      Logger.log("Spreadsheet access failed. Check SPREADSHEET_URL");
+      return;
+    }
+
+    // Tab 1: Hourly costs per campaign
+    const hourlySheet = getOrCreateSheet(ss, "HourlyCosts", getHourlyHeaders(currencyCode));
+    const hourlyRecords = fetchHourlyCosts();
+    if (hourlyRecords.length > 0) {
+      const newHourlyRecords = filterHourlyDuplicates(hourlySheet, hourlyRecords);
+      if (newHourlyRecords.length > 0) {
+        appendRecords(hourlySheet, newHourlyRecords, true, currencyCode);
+        logDebug(`Wrote ${newHourlyRecords.length} new records to HourlyCosts`);
+      } else {
+        logDebug("All hourly records already exist - skipping.");
+      }
+    } else {
+      logDebug("No hourly records to write.");
+    }
+
+    // Tab 2: Daily costs per campaign (yesterday only, with duplicate check)
+    const dailySheet = getOrCreateSheet(ss, "DailyCosts", getDailyHeaders(currencyCode));
+    const dailyRecords = fetchDailyCosts();
+    if (dailyRecords.length > 0) {
+      const newRecords = filterDuplicates(dailySheet, dailyRecords);
+      if (newRecords.length > 0) {
+        appendRecords(dailySheet, newRecords, false, currencyCode);
+        logDebug(`Wrote ${newRecords.length} new records to DailyCosts`);
+      } else {
+        logDebug("All daily records already exist - skipping.");
+      }
+    } else {
+      logDebug("No daily records to write.");
+    }
+
+    logDebug("=== Hourly & Daily Spend Logger done ===");
+  } catch (e) {
+    Logger.log(`Error in main function: ${e}`);
   }
-
-  // Allow config overrides via optional sheet called "Config"
-  updateConfigFromSheet(ss);
-
-  const sheet = getOrCreateSheet(ss, CONFIG.sheetName, getHeaders());
-  const records = fetchSpendPerType();
-
-  if (records.length === 0) {
-    logDebug("No records returned – nothing to write.");
-    return;
-  }
-
-  appendRecords(sheet, records);
-  logDebug(`Wrote ${records.length} records to sheet ${CONFIG.sheetName}`);
-  logDebug("=== Simple Hourly Spend Logger done ===");
 }
 
 /**
- * Fetch spend and key metrics grouped by date & campaign type.
- * Returns array of objects matching the sheet columns.
+ * Fetch hourly costs for the last complete hour, per individual campaign
  */
-function fetchSpendPerType() {
+function fetchHourlyCosts() {
   const now = new Date();
-  const endDate = new Date(now);
-  if (CONFIG.excludeToday) endDate.setDate(endDate.getDate() - 1);
-  const startDate = new Date(endDate);
-  startDate.setDate(startDate.getDate() - CONFIG.daysToTrack + 1);
+  const lastCompleteHour = new Date(now);
+  lastCompleteHour.setHours(now.getHours() - 1);
+  lastCompleteHour.setMinutes(0, 0, 0);
+  
+  const dateForQuery = Utilities.formatDate(lastCompleteHour, CONFIG.timeZone, 'yyyyMMdd');
+  const dateForDisplay = Utilities.formatDate(lastCompleteHour, CONFIG.timeZone, 'yyyy-MM-dd');
+  const hour = Utilities.formatDate(lastCompleteHour, CONFIG.timeZone, 'HH:00');
+  const hourOfDay = parseInt(Utilities.formatDate(lastCompleteHour, CONFIG.timeZone, 'HH'));
+  
+  logDebug(`Fetching hourly data for ${dateForQuery} hour ${hour}`);
 
-  const dateFrom = Utilities.formatDate(startDate, CONFIG.timeZone, 'yyyyMMdd');
-  const dateTo   = Utilities.formatDate(endDate,   CONFIG.timeZone, 'yyyyMMdd');
-  logDebug(`Fetching data from ${dateFrom} to ${dateTo}`);
-
-  // Optional label filtering → create a Set of campaignIds that have the label
+  // Optional label filtering
   let allowedCampaignIds = null;
   if (CONFIG.labelName !== "none") {
     allowedCampaignIds = getLabeledCampaignIds();
-    logDebug(`Label filter active → ${allowedCampaignIds.size} campaignIds allowed`);
+    logDebug(`Label filter active → ${allowedCampaignIds.size} campaigns allowed`);
   }
 
-  const query = `SELECT \
-      segments.date,\n      campaign.id,\n      campaign.advertising_channel_type,\n      metrics.cost_micros,\n      metrics.clicks,\n      metrics.impressions,\n      metrics.conversions,\n      metrics.conversions_value\n    FROM campaign\n    WHERE segments.date BETWEEN '${dateFrom}' AND '${dateTo}'\n      AND campaign.status = 'ENABLED'`;
+  const query = `
+    SELECT 
+      segments.date,
+      segments.hour,
+      campaign.id,
+      campaign.name,
+      campaign.advertising_channel_type,
+      metrics.cost_micros,
+      metrics.clicks,
+      metrics.impressions,
+      metrics.conversions,
+      metrics.conversions_value
+    FROM campaign
+    WHERE segments.date = '${dateForQuery}'
+      AND segments.hour = ${hourOfDay}
+      AND campaign.status = 'ENABLED'
+  `;
 
   const report = AdsApp.report(query);
-  const rows   = report.rows();
+  const rows = report.rows();
+  const records = [];
 
-  // Aggregate per (date × campaignType)
-  const map = {};
   while (rows.hasNext()) {
-    const r      = rows.next();
-    const cid    = r['campaign.id'];
-    if (allowedCampaignIds && !allowedCampaignIds.has(cid)) continue;
+    try {
+      const row = rows.next();
+      const cid = row['campaign.id'];
+      if (!cid) continue; // Skip if no campaign ID
+      
+      if (allowedCampaignIds && !allowedCampaignIds.has(cid)) continue;
 
-    const date        = r['segments.date'];
-    const typeRaw     = r['campaign.advertising_channel_type'] || 'UNKNOWN';
-    const campaignType = classifyCampaignType(typeRaw);
+      const campaignName = row['campaign.name'] || '';
+      const typeRaw = row['campaign.advertising_channel_type'] || 'UNKNOWN';
+      const campaignType = classifyCampaignType(typeRaw);
 
-    const key = date + '|' + campaignType;
-    if (!map[key]) {
-      map[key] = {
-        date: date,
+      const costMicros = Number(row['metrics.cost_micros']) || 0;
+      const clicks = Number(row['metrics.clicks']) || 0;
+      const impressions = Number(row['metrics.impressions']) || 0;
+      const conversions = Number(row['metrics.conversions']) || 0;
+      const convValue = Number(row['metrics.conversions_value']) || 0;
+
+      records.push({
+        date: dateForDisplay,
+        hour: hour,
+        campaignId: cid,
+        campaignName: campaignName,
         campaignType: campaignType,
-        cost: 0,
-        clicks: 0,
-        impressions: 0,
-        conversions: 0,
-        convValue: 0
-      };
+        cost: costMicros / 1000000,
+        clicks: clicks,
+        impressions: impressions,
+        conversions: conversions,
+        convValue: convValue
+      });
+    } catch (e) {
+      Logger.log(`Error processing hourly row: ${e}`);
     }
-    const m = map[key];
-    m.cost         += (+r['metrics.cost_micros']) / 1e6; // to euros
-    m.clicks       += parseInt(r['metrics.clicks'])       || 0;
-    m.impressions  += parseInt(r['metrics.impressions'])  || 0;
-    m.conversions  += parseFloat(r['metrics.conversions'])|| 0;
-    m.convValue    += parseFloat(r['metrics.conversions_value']) || 0;
   }
 
-  // Convert map → array of rows
-  const retrievedAt = new Date();
-  return Object.values(map).map(rec => ({
-    retrievedAt: retrievedAt,
-    date: rec.date,
-    campaignType: rec.campaignType,
-    cost: rec.cost,
-    clicks: rec.clicks,
-    impressions: rec.impressions,
-    conversions: rec.conversions,
-    convValue: rec.convValue
-  }));
+  return records;
+}
+
+/**
+ * Fetch daily costs for yesterday, per individual campaign
+ */
+function fetchDailyCosts() {
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  const dateForQuery = Utilities.formatDate(yesterday, CONFIG.timeZone, 'yyyyMMdd');
+  const dateForDisplay = Utilities.formatDate(yesterday, CONFIG.timeZone, 'yyyy-MM-dd');
+  
+  logDebug(`Fetching daily data for ${dateForQuery}`);
+
+  // Optional label filtering
+  let allowedCampaignIds = null;
+  if (CONFIG.labelName !== "none") {
+    allowedCampaignIds = getLabeledCampaignIds();
+    logDebug(`Label filter active → ${allowedCampaignIds.size} campaigns allowed`);
+  }
+
+  const query = `
+    SELECT 
+      segments.date,
+      campaign.id,
+      campaign.name,
+      campaign.advertising_channel_type,
+      metrics.cost_micros,
+      metrics.clicks,
+      metrics.impressions,
+      metrics.conversions,
+      metrics.conversions_value
+    FROM campaign
+    WHERE segments.date = '${dateForQuery}'
+      AND campaign.status = 'ENABLED'
+  `;
+
+  const report = AdsApp.report(query);
+  const rows = report.rows();
+  const records = [];
+
+  while (rows.hasNext()) {
+    try {
+      const row = rows.next();
+      const cid = row['campaign.id'];
+      if (!cid) continue; // Skip if no campaign ID
+      
+      if (allowedCampaignIds && !allowedCampaignIds.has(cid)) continue;
+
+      const campaignName = row['campaign.name'] || '';
+      const typeRaw = row['campaign.advertising_channel_type'] || 'UNKNOWN';
+      const campaignType = classifyCampaignType(typeRaw);
+
+      const costMicros = Number(row['metrics.cost_micros']) || 0;
+      const clicks = Number(row['metrics.clicks']) || 0;
+      const impressions = Number(row['metrics.impressions']) || 0;
+      const conversions = Number(row['metrics.conversions']) || 0;
+      const convValue = Number(row['metrics.conversions_value']) || 0;
+
+      records.push({
+        date: dateForDisplay,
+        campaignId: cid,
+        campaignName: campaignName,
+        campaignType: campaignType,
+        cost: costMicros / 1000000,
+        clicks: clicks,
+        impressions: impressions,
+        conversions: conversions,
+        convValue: convValue
+      });
+    } catch (e) {
+      Logger.log(`Error processing daily row: ${e}`);
+    }
+  }
+
+  return records;
 }
 
 /** Write records to sheet (appended beneath existing data) */
-function appendRecords(sheet, records) {
-  const rows = records.map(r => [
-    r.retrievedAt,
-    r.date,
-    r.campaignType,
-    r.cost,
-    r.clicks,
-    r.impressions,
-    r.conversions,
-    r.convValue
-  ]);
+function appendRecords(sheet, records, isHourly, currencyCode) {
+  const rows = isHourly 
+    ? records.map(r => [
+        r.date,
+        r.hour,
+        r.campaignId,
+        r.campaignName,
+        r.campaignType,
+        r.cost,
+        r.clicks,
+        r.impressions,
+        r.conversions,
+        r.convValue
+      ])
+    : records.map(r => [
+        r.date,
+        r.campaignId,
+        r.campaignName,
+        r.campaignType,
+        r.cost,
+        r.clicks,
+        r.impressions,
+        r.conversions,
+        r.convValue
+      ]);
 
   const startRow = sheet.getLastRow() + 1;
   const range = sheet.getRange(startRow, 1, rows.length, rows[0].length);
   range.setValues(rows);
 
-  // Basic formatting – currency columns
-  const eurCols = [4, 8]; // 1-indexed columns: Cost & Conversion value
-  eurCols.forEach(col => sheet.getRange(startRow, col, rows.length, 1).setNumberFormat('€#,##0.00'));
+  // Basic formatting – currency columns (Cost & Conversion Value)
+  const costCol = isHourly ? 6 : 5;
+  const convValueCol = isHourly ? 10 : 9;
+  
+  // Get currency symbol based on currency code
+  const currencySymbol = getCurrencySymbol(currencyCode);
+  const numberFormat = currencySymbol ? `${currencySymbol}#,##0.00` : '#,##0.00';
+  
+  sheet.getRange(startRow, costCol, rows.length, 1).setNumberFormat(numberFormat);
+  sheet.getRange(startRow, convValueCol, rows.length, 1).setNumberFormat(numberFormat);
+}
+
+/** Filter out records that already exist in the sheet (for hourly tab) */
+function filterHourlyDuplicates(sheet, records) {
+  if (sheet.getLastRow() <= 1) return records; // No data yet
+
+  const existingData = sheet.getRange(2, 1, sheet.getLastRow() - 1, 3).getValues();
+  const existingKeys = new Set();
+  existingData.forEach(row => {
+    // Normalize date to string format yyyy-MM-dd
+    const dateStr = row[0] instanceof Date 
+      ? Utilities.formatDate(row[0], CONFIG.timeZone, 'yyyy-MM-dd')
+      : String(row[0]);
+    // Normalize hour - might be stored as Date/Time object in Sheets
+    const hourStr = row[1] instanceof Date
+      ? Utilities.formatDate(row[1], CONFIG.timeZone, 'HH:00')
+      : String(row[1]);
+    const campaignIdStr = String(row[2]);
+    const key = `${dateStr}|${hourStr}|${campaignIdStr}`; // date|hour|campaignId
+    existingKeys.add(key);
+  });
+
+  logDebug(`HourlyCosts: Found ${existingKeys.size} existing records`);
+
+  const filtered = records.filter(r => {
+    const key = `${r.date}|${r.hour}|${String(r.campaignId)}`;
+    const exists = existingKeys.has(key);
+    if (exists && CONFIG.DEBUG) {
+      logDebug(`  Skipping duplicate: ${key}`);
+    }
+    return !exists;
+  });
+
+  return filtered;
+}
+
+/** Filter out records that already exist in the sheet (for daily tab) */
+function filterDuplicates(sheet, records) {
+  if (sheet.getLastRow() <= 1) return records; // No data yet
+
+  const existingData = sheet.getRange(2, 1, sheet.getLastRow() - 1, 2).getValues();
+  const existingKeys = new Set();
+  existingData.forEach(row => {
+    // Normalize date to string format yyyy-MM-dd
+    const dateStr = row[0] instanceof Date 
+      ? Utilities.formatDate(row[0], CONFIG.timeZone, 'yyyy-MM-dd')
+      : String(row[0]);
+    const key = `${dateStr}|${row[1]}`; // date|campaignId
+    existingKeys.add(key);
+  });
+
+  logDebug(`DailyCosts: Found ${existingKeys.size} existing records`);
+
+  const filtered = records.filter(r => {
+    const key = `${r.date}|${r.campaignId}`;
+    const exists = existingKeys.has(key);
+    if (exists && CONFIG.DEBUG) {
+      logDebug(`  Skipping duplicate: ${key}`);
+    }
+    return !exists;
+  });
+
+  return filtered;
 }
 
 /** Ensure sheet exists and has headers */
@@ -169,16 +383,34 @@ function getOrCreateSheet(ss, name, headers) {
   return sh;
 }
 
-function getHeaders() {
+function getHourlyHeaders(currencyCode) {
+  const currency = currencyCode ? ` (${currencyCode})` : '';
   return [
-    'Retrieved At',
     'Date',
+    'Hour',
+    'Campaign ID',
+    'Campaign Name',
     'Campaign Type',
-    'Cost (€)',
+    `Cost${currency}`,
     'Clicks',
     'Impressions',
     'Conversions',
-    'Conversion Value (€)'
+    `Conversion Value${currency}`
+  ];
+}
+
+function getDailyHeaders(currencyCode) {
+  const currency = currencyCode ? ` (${currencyCode})` : '';
+  return [
+    'Date',
+    'Campaign ID',
+    'Campaign Name',
+    'Campaign Type',
+    `Cost${currency}`,
+    'Clicks',
+    'Impressions',
+    'Conversions',
+    `Conversion Value${currency}`
   ];
 }
 
@@ -221,25 +453,24 @@ function classifyCampaignType(channelType) {
   }
 }
 
-/**
- * Optionally override CONFIG values via a sheet called "Config" (2 columns)
- */
-function updateConfigFromSheet(ss) {
-  const configSheet = ss.getSheetByName('Config');
-  if (!configSheet) return; // nothing to override
-  const rows = configSheet.getDataRange().getValues();
-  rows.forEach(r => {
-    if (!r[0] || r[1] === '') return;
-    const key = r[0].toString().trim();
-    const val = r[1];
-    switch (key) {
-      case 'daysToTrack':   CONFIG.daysToTrack   = parseInt(val) || CONFIG.daysToTrack; break;
-      case 'excludeToday':  CONFIG.excludeToday  = val === true || val.toString().toLowerCase()==='true'; break;
-      case 'labelName':     CONFIG.labelName     = val.toString(); break;
-      case 'sheetName':     CONFIG.sheetName     = val.toString(); break;
-      case 'DEBUG':         CONFIG.DEBUG         = val === true || val.toString().toLowerCase()==='true'; break;
-      case 'timeZone':      CONFIG.timeZone      = val.toString(); break;
-    }
-  });
-  logDebug('CONFIG overridden via Config sheet');
-} 
+/** Get currency symbol for number formatting based on currency code */
+function getCurrencySymbol(currencyCode) {
+  const symbols = {
+    'EUR': '€',
+    'USD': '$',
+    'GBP': '£',
+    'JPY': '¥',
+    'CHF': 'CHF ',
+    'CAD': 'CA$',
+    'AUD': 'A$',
+    'NZD': 'NZ$',
+    'ZAR': 'R ',
+    'SEK': 'kr ',
+    'NOK': 'kr ',
+    'DKK': 'kr ',
+    'PLN': 'zł ',
+    'CZK': 'Kč ',
+    'HUF': 'Ft '
+  };
+  return symbols[currencyCode] || '';
+}
